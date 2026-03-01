@@ -15,9 +15,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property(readonly) NSStreamStatus streamStatus;
 @property(nullable, readonly, copy) NSError* streamError;
+@property(nullable, readonly) NSDictionary* winningConnectionDetails;
 
 
 +(void) connectWithSNIDomain:(NSString*) SNIDomain connectHost:(NSString*) host connectPort:(NSNumber*) port tls:(BOOL) tls inputStream:(NSInputStream* _Nullable * _Nonnull) inputStream  outputStream:(NSOutputStream* _Nullable * _Nonnull) outputStream logtag:(id _Nullable) logtag;
++(void) connectWithSNIDomain:(NSString*) SNIDomain connectEntries:(NSArray<NSDictionary*>*) connectEntries inputStream:(NSInputStream* _Nullable * _Nonnull) inputStream  outputStream:(NSOutputStream* _Nullable * _Nonnull) outputStream logtag:(id _Nullable) logtag;
 -(void) startTLS;
 @property(readonly) BOOL hasTLS;
 @property(readonly) BOOL isTLS13;

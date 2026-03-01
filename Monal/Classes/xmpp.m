@@ -87,6 +87,11 @@ static NSRegularExpression* fastTokenRemovalRegex;
     dispatch_queue_t _xmlParserFeedingQueue;
     // buffer for stanzas we can not (completely) write to the tcp socket
     BOOL _streamHasSpace;
+    BOOL _streamStartPending;
+    NSArray<NSDictionary*>* _connectEntriesToUse;
+    NSArray<NSDictionary*>* _srvRemainingEntriesAfterCurrentBucket;
+    BOOL _srvBucketConnectInProgress;
+    BOOL _preferLastUsedServerThisConnect;
 
     //parser and queue related stuff
     XmlParserBridge* _xmlParser;
@@ -272,6 +277,11 @@ static NSRegularExpression* fastTokenRemovalRegex;
     _disconnectInProgres = NO;
     _lastIdleState = NO;
     _outputQueue = [NSMutableArray new];
+    _streamStartPending = NO;
+    _connectEntriesToUse = nil;
+    _srvRemainingEntriesAfterCurrentBucket = nil;
+    _srvBucketConnectInProgress = NO;
+    _preferLastUsedServerThisConnect = NO;
     _iqHandlers = [NSMutableDictionary new];
     _reconnectionHandlers = [NSMutableArray new];
     _mamPageArrays = [NSMutableDictionary new];
@@ -573,22 +583,84 @@ static NSRegularExpression* fastTokenRemovalRegex;
     DDLogVerbose(@"Cleanup of sendQueue finished");
 }
 
+-(void) startXMPPStreamAfterTCPConnected
+{
+    //MLStream will automatically use tcp fast open for direct tls connections
+    if(self.connectionProperties.server.isDirectTLS == YES)
+    {
+        [self startXMPPStreamWithXMLOpening:YES];
+
+        //pipeline auth request onto our stream header if we have cached stream features available
+        if(_cachedStreamFeaturesBeforeAuth != nil)
+        {
+            DDLogDebug(@"Pipelining auth using cached stream features: %@", _cachedStreamFeaturesBeforeAuth);
+            _pipeliningState = kPipelinedAuth;
+            [self handleFeaturesBeforeAuth:_cachedStreamFeaturesBeforeAuth];
+        }
+    }
+    else
+    {
+        //send stream start and starttls nonza as tcp fastopen idempotent data if not in direct tls mode
+        //(this will concatenate everything to one single NSString queue entry)
+        //(not doing this will cause the network framework to only send the first queue entry (the xml opening) but not the stream start itself)
+        [self startXMPPStreamWithXMLOpening:YES withStartTLS:YES andDirectWrite:YES];
+    }
+}
+
 -(void) createStreams
 {
-    DDLogInfo(@"stream creating to server: %@ port: %@ directTLS: %@", self.connectionProperties.server.connectServer, self.connectionProperties.server.connectPort, bool2str(self.connectionProperties.server.isDirectTLS));
+    NSArray<NSDictionary*>* connectEntries = _connectEntriesToUse;
+    _connectEntriesToUse = nil;
+    if(connectEntries == nil || [connectEntries count] == 0)
+        connectEntries = @[@{
+            @"connectHost": self.connectionProperties.server.connectServer,
+            @"connectPort": self.connectionProperties.server.connectPort,
+            @"isSecure": [NSNumber numberWithBool:self.connectionProperties.server.isDirectTLS],
+        }];
+
+    NSDictionary* firstEntry = connectEntries[0];
+    NSString* firstHost = nilExtractor(firstEntry[@"connectHost"]);
+    if(firstHost == nil)
+        firstHost = nilExtractor(firstEntry[@"server"]);
+    NSNumber* firstPort = nilExtractor(firstEntry[@"connectPort"]);
+    if(firstPort == nil)
+        firstPort = nilExtractor(firstEntry[@"port"]);
+    BOOL firstIsSecure = [firstEntry[@"isSecure"] boolValue];
+
+    if(firstHost == nil || firstPort == nil)
+    {
+        DDLogError(@"First connection entry malformed: %@", firstEntry);
+        [self postError:NSLocalizedString(@"Unable to connect to server!", @"") withIsSevere:NO];
+        [self reconnect];
+        return;
+    }
+
+    [self.connectionProperties.server updateConnectServer:firstHost];
+    [self.connectionProperties.server updateConnectPort:firstPort];
+    [self.connectionProperties.server updateConnectTLS:firstIsSecure];
+
+    DDLogInfo(@"stream creating using %lu candidate(s), first candidate host=%@ port=%@ directTLS=%@", (unsigned long)[connectEntries count], firstHost, firstPort, bool2str(firstIsSecure));
     
     NSInputStream* localIStream;
     NSOutputStream* localOStream;
     
-    if(self.connectionProperties.server.isDirectTLS == YES)
+    if([connectEntries count] > 1)
     {
+        _streamStartPending = YES;
+        DDLogInfo(@"creating happy-eyeballs streams");
+        [MLStream connectWithSNIDomain:self.connectionProperties.identity.domain connectEntries:connectEntries inputStream:&localIStream outputStream:&localOStream logtag:self->_logtag];
+    }
+    else if(firstIsSecure == YES)
+    {
+        _streamStartPending = NO;
         DDLogInfo(@"creating directTLS streams");
-        [MLStream connectWithSNIDomain:self.connectionProperties.identity.domain connectHost:self.connectionProperties.server.connectServer connectPort:self.connectionProperties.server.connectPort tls:YES inputStream:&localIStream outputStream:&localOStream logtag:self->_logtag];
+        [MLStream connectWithSNIDomain:self.connectionProperties.identity.domain connectHost:firstHost connectPort:firstPort tls:YES inputStream:&localIStream outputStream:&localOStream logtag:self->_logtag];
     }
     else
     {
+        _streamStartPending = NO;
         DDLogInfo(@"creating plaintext streams");
-        [MLStream connectWithSNIDomain:self.connectionProperties.identity.domain connectHost:self.connectionProperties.server.connectServer connectPort:self.connectionProperties.server.connectPort tls:NO inputStream:&localIStream outputStream:&localOStream logtag:self->_logtag];
+        [MLStream connectWithSNIDomain:self.connectionProperties.identity.domain connectHost:firstHost connectPort:firstPort tls:NO inputStream:&localIStream outputStream:&localOStream logtag:self->_logtag];
     }
     
     if((localIStream == nil) || (localOStream == nil))
@@ -620,34 +692,91 @@ static NSRegularExpression* fastTokenRemovalRegex;
     //prepare xmpp parser (this is the first time for this connection --> we don't need to clear the receive queue)
     [self prepareXMPPParser];
     
-    //MLStream will automatically use tcp fast open for direct tls connections
-    if(self.connectionProperties.server.isDirectTLS == YES)
+    if(!_streamStartPending)
+        [self startXMPPStreamAfterTCPConnected];
+}
+
++(NSDictionary*) splitSrvEntriesByPriority:(NSArray<NSDictionary*>*) entries
+{
+    NSMutableArray<NSDictionary*>* samePriorityEntries = [NSMutableArray new];
+    NSMutableArray<NSDictionary*>* remainingEntries = [NSMutableArray new];
+    NSNumber* selectedPriority = nil;
+
+    if([entries count] > 0)
     {
-        [self startXMPPStreamWithXMLOpening:YES];
+        selectedPriority = entries[0][@"priority"];
+        for(NSDictionary* row in entries)
+            if([row[@"priority"] isEqualToNumber:selectedPriority])
+                [samePriorityEntries addObject:row];
+            else
+                [remainingEntries addObject:row];
+    }
+
+    NSMutableDictionary* result = [NSMutableDictionary new];
+    if(selectedPriority != nil)
+        result[@"priority"] = selectedPriority;
+    result[@"samePriorityEntries"] = [samePriorityEntries copy];
+    result[@"remainingEntries"] = [remainingEntries copy];
+    return [result copy];
+}
+
++(NSArray<NSDictionary*>*) weightedOrderForSrvEntries:(NSArray<NSDictionary*>*) entries
+{
+    NSMutableArray<NSDictionary*>* remaining = [entries mutableCopy];
+    NSMutableArray<NSDictionary*>* weighted = [NSMutableArray new];
+
+    while([remaining count] > 0)
+    {
+        u_int32_t sum = 0;
+        for(NSDictionary* entry in remaining)
+            sum += [entry[@"weight"] unsignedIntValue];
         
-        //pipeline auth request onto our stream header if we have cached stream features available
-        if(_cachedStreamFeaturesBeforeAuth != nil)
+        NSUInteger selectedIndex = 0;
+        if(sum == 0)
+            selectedIndex = arc4random_uniform((u_int32_t)[remaining count]);
+        else
         {
-            DDLogDebug(@"Pipelining auth using cached stream features: %@", _cachedStreamFeaturesBeforeAuth);
-            _pipeliningState = kPipelinedAuth;
-            [self handleFeaturesBeforeAuth:_cachedStreamFeaturesBeforeAuth];
+            u_int32_t value = arc4random_uniform(sum);
+            u_int32_t running = 0;
+            for(NSUInteger i = 0; i < [remaining count]; i++)
+            {
+                running += [remaining[i][@"weight"] unsignedIntValue];
+                if(value < running)
+                {
+                    selectedIndex = i;
+                    break;
+                }
+            }
         }
+
+        [weighted addObject:remaining[selectedIndex]];
+        [remaining removeObjectAtIndex:selectedIndex];
     }
-    else
-    {
-        //send stream start and starttls nonza as tcp fastopen idempotent data if not in direct tls mode
-        //(this will concatenate everything to one single NSString queue entry)
-        //(not doing this will cause the network framework to only send the first queue entry (the xml opening) but not the stream start itself)
-        [self startXMPPStreamWithXMLOpening:YES withStartTLS:YES andDirectWrite:YES];
-    }
+    return weighted;
+}
+
+-(NSArray<NSDictionary*>*) weightedOrderForSrvEntries:(NSArray<NSDictionary*>*) entries
+{
+    return [xmpp weightedOrderForSrvEntries:entries];
 }
 
 -(BOOL) connectionTask
 {
+    BOOL preferLastUsedServer = _preferLastUsedServerThisConnect;
+    _preferLastUsedServerThisConnect = NO;
+    _srvRemainingEntriesAfterCurrentBucket = nil;
+    _srvBucketConnectInProgress = NO;
+
     // allow override for server and port if one is specified for the account
     if(![self.connectionProperties.server.host isEqual:@""])
     {
         DDLogInfo(@"Ignoring SRV records for this connection, server manually configured: %@:%@", self.connectionProperties.server.connectServer, self.connectionProperties.server.connectPort);
+        NSDictionary* connectEntry = @{
+            @"connectHost": self.connectionProperties.server.connectServer,
+            @"connectPort": self.connectionProperties.server.connectPort,
+            @"isSecure": [NSNumber numberWithBool:self.connectionProperties.server.isDirectTLS],
+        };
+        _connectEntriesToUse = @[connectEntry];
         [self createStreams];
         return NO;
     }
@@ -670,14 +799,6 @@ static NSRegularExpression* fastTokenRemovalRegex;
         DDLogInfo(@"Querying for SRV records");
         _discoveredServersList = [[MLDNSLookup new] dnsDiscoverOnDomain:self.connectionProperties.identity.domain];
         _SRVDiscoveryDone = YES;
-        // no SRV records found, update server to directly connect to specified domain
-        if([_discoveredServersList count] == 0)
-        {
-            [self.connectionProperties.server updateConnectServer:self.connectionProperties.identity.domain];
-            [self.connectionProperties.server updateConnectPort:@5222];
-            [self.connectionProperties.server updateConnectTLS:NO];
-            DDLogInfo(@"NO SRV records found, using standard xmpp config: %@:%@ (using starttls)", self.connectionProperties.server.connectServer, self.connectionProperties.server.connectPort);
-        }
     }
     
     // Show warning when xmpp-client srv entry prohibits connections
@@ -710,32 +831,94 @@ static NSRegularExpression* fastTokenRemovalRegex;
 
     if([_usableServersList count] > 0)
     {
-        DDLogInfo(@"Using connection parameters discovered via SRV dns record: server=%@, port=%@, isSecure=%s, priority=%@, ttl=%@",
-            [[_usableServersList objectAtIndex:0] objectForKey:@"server"],
-            [[_usableServersList objectAtIndex:0] objectForKey:@"port"],
-            [[[_usableServersList objectAtIndex:0] objectForKey:@"isSecure"] boolValue] ? "YES" : "NO",
-            [[_usableServersList objectAtIndex:0] objectForKey:@"priority"],
-            [[_usableServersList objectAtIndex:0] objectForKey:@"ttl"]
-        );
-        [self.connectionProperties.server updateConnectServer: [[_usableServersList objectAtIndex:0] objectForKey:@"server"]];
-        [self.connectionProperties.server updateConnectPort: [[_usableServersList objectAtIndex:0] objectForKey:@"port"]];
-        [self.connectionProperties.server updateConnectTLS: [[[_usableServersList objectAtIndex:0] objectForKey:@"isSecure"] boolValue]];
-        // remove this server so that the next connection attempt will try the next server in the list
-        [_usableServersList removeObjectAtIndex:0];
-        DDLogInfo(@"%lu SRV entries left:", (unsigned long)[_usableServersList count]);
-        for(NSDictionary* row in _usableServersList)
-            DDLogInfo(@"SRV entry in _usableServersList: server=%@, port=%@, isSecure=%s, priority=%@, ttl=%@",
+        NSDictionary* splitResult = [xmpp splitSrvEntriesByPriority:_usableServersList];
+        NSNumber* selectedPriority = splitResult[@"priority"];
+        NSArray<NSDictionary*>* samePriorityEntries = splitResult[@"samePriorityEntries"];
+        NSArray<NSDictionary*>* remainingEntries = splitResult[@"remainingEntries"];
+        _srvRemainingEntriesAfterCurrentBucket = remainingEntries;
+        _srvBucketConnectInProgress = YES;
+
+        NSArray<NSDictionary*>* weightedEntries = [self weightedOrderForSrvEntries:samePriorityEntries];
+        if(preferLastUsedServer)
+        {
+            NSString* preferredHost = self.connectionProperties.server.connectServer;
+            NSNumber* preferredPort = self.connectionProperties.server.connectPort;
+            if(preferredHost != nil && ![preferredHost isEqual:@""] && preferredPort != nil)
+            {
+                NSInteger matchingIndex = NSNotFound;
+                for(NSUInteger i = 0; i < [weightedEntries count]; i++)
+                {
+                    NSDictionary* row = weightedEntries[i];
+                    NSString* host = nilExtractor(row[@"connectHost"]);
+                    if(host == nil)
+                        host = nilExtractor(row[@"server"]);
+                    NSNumber* port = nilExtractor(row[@"connectPort"]);
+                    if(port == nil)
+                        port = nilExtractor(row[@"port"]);
+                    if(host != nil && port != nil && [host isEqualToString:preferredHost] && [port isEqualToNumber:preferredPort])
+                    {
+                        matchingIndex = (NSInteger)i;
+                        break;
+                    }
+                }
+                
+                if(matchingIndex != NSNotFound)
+                {
+                    NSMutableArray<NSDictionary*>* reorderedEntries = [weightedEntries mutableCopy];
+                    NSDictionary* entry = reorderedEntries[(NSUInteger)matchingIndex];
+                    [reorderedEntries removeObjectAtIndex:(NSUInteger)matchingIndex];
+                    [reorderedEntries insertObject:entry atIndex:0];
+                    weightedEntries = [reorderedEntries copy];
+                }
+                else
+                {
+                    NSDictionary* preferredEntry = @{
+                        @"connectHost": preferredHost,
+                        @"connectPort": preferredPort,
+                        @"server": preferredHost,
+                        @"port": preferredPort,
+                        @"isSecure": [NSNumber numberWithBool:self.connectionProperties.server.isDirectTLS],
+                    };
+                    weightedEntries = [@[preferredEntry] arrayByAddingObjectsFromArray:weightedEntries];
+                }
+            }
+        }
+        DDLogInfo(@"Using SRV priority bucket %@ containing %lu entries", selectedPriority, (unsigned long)[weightedEntries count]);
+        for(NSDictionary* row in weightedEntries)
+            DDLogInfo(@"SRV bucket entry: server=%@, port=%@, isSecure=%s, priority=%@, weight=%@, ttl=%@",
+                [row objectForKey:@"server"],
+                [row objectForKey:@"port"],
+                [[row objectForKey:@"isSecure"] boolValue] ? "YES" : "NO",
+                [row objectForKey:@"priority"],
+                [row objectForKey:@"weight"],
+                [row objectForKey:@"ttl"]
+            );
+
+        DDLogInfo(@"%lu SRV entries left:", (unsigned long)[remainingEntries count]);
+        for(NSDictionary* row in remainingEntries)
+            DDLogInfo(@"SRV entry in remainingEntries: server=%@, port=%@, isSecure=%s, priority=%@, ttl=%@",
                 [row objectForKey:@"server"],
                 [row objectForKey:@"port"],
                 [[row objectForKey:@"isSecure"] boolValue] ? "YES" : "NO",
                 [row objectForKey:@"priority"],
                 [row objectForKey:@"ttl"]
             );
+
+        _connectEntriesToUse = weightedEntries;
+        [self createStreams];
     }
     else
+    {
         DDLogWarn(@"No SRV records discovered, using legacy starttls to A/AAAA record of domain!");
-    
-    [self createStreams];
+        // no SRV records found, update server to directly connect to specified domain
+        NSDictionary* fallbackEntry = @{
+            @"connectHost": self.connectionProperties.identity.domain,
+            @"connectPort": @5222,
+            @"isSecure": @NO,
+        };
+        _connectEntriesToUse = @[fallbackEntry];
+        [self createStreams];
+    }
     return NO;
 }
 
@@ -1286,6 +1469,11 @@ static NSRegularExpression* fastTokenRemovalRegex;
 
         DDLogInfo(@"resetting internal stream state to disconnected");
         self->_startTLSComplete = NO;
+        self->_streamStartPending = NO;
+        self->_connectEntriesToUse = nil;
+        self->_srvRemainingEntriesAfterCurrentBucket = nil;
+        self->_srvBucketConnectInProgress = NO;
+        self->_preferLastUsedServerThisConnect = NO;
         self->_catchupDone = NO;
         self->_accountState = kStateDisconnected;
         
@@ -1348,7 +1536,10 @@ static NSRegularExpression* fastTokenRemovalRegex;
             [self dispatchAsyncOnReceiveQueue: ^{
                 //there may be another connect/login operation in progress triggered from reachability or another timer
                 if(self.accountState<kStateReconnecting)
+                {
+                    self->_preferLastUsedServerThisConnect = YES;
                     [self connect];
+                }
                 self->_reconnectInProgress = NO;
             }];
         }), (^{
@@ -5243,7 +5434,32 @@ static NSRegularExpression* fastTokenRemovalRegex;
             if(stream == _oStream)
             {
                 self->_streamHasSpace = NO;
+                self->_srvBucketConnectInProgress = NO;
+                self->_srvRemainingEntriesAfterCurrentBucket = nil;
                 
+                if(self->_streamStartPending)
+                {
+                    NSDictionary* winningConnection = nil;
+                    if([self->_oStream isKindOfClass:[MLStream class]])
+                        winningConnection = [((MLStream*)self->_oStream) winningConnectionDetails];
+
+                    NSString* winningHost = nilExtractor(winningConnection[@"connectHost"]);
+                    NSNumber* winningPort = nilExtractor(winningConnection[@"connectPort"]);
+                    BOOL winningIsSecure = [winningConnection[@"isSecure"] boolValue];
+                    if(winningConnection != nil && winningHost != nil && winningPort != nil)
+                    {
+                        DDLogInfo(@"Happy-eyeballs winner selected: host=%@ port=%@ directTLS=%@", winningHost, winningPort, bool2str(winningIsSecure));
+                        [self.connectionProperties.server updateConnectServer:winningHost];
+                        [self.connectionProperties.server updateConnectPort:winningPort];
+                        [self.connectionProperties.server updateConnectTLS:winningIsSecure];
+                    }
+                    else
+                        DDLogWarn(@"Could not determine happy-eyeballs winner details, using existing connection properties");
+
+                    self->_streamStartPending = NO;
+                    [self startXMPPStreamAfterTCPConnected];
+                }
+
                 //restart logintimer when our output stream becomes readable (don't do anything without a running timer)
                 if(_loginTimer != nil && self->_accountState < kStateLoggedIn)
                     [self reinitLoginTimer];
@@ -5323,6 +5539,14 @@ static NSRegularExpression* fastTokenRemovalRegex;
             {
                 DDLogInfo(@"Ignoring stream error in %@: already disconnecting...", stream);
                 break;
+            }
+
+            if(self->_srvBucketConnectInProgress && self.accountState < kStateConnected && self->_srvRemainingEntriesAfterCurrentBucket != nil)
+            {
+                DDLogInfo(@"Connection attempt for current SRV priority bucket failed, advancing to next priority");
+                self->_usableServersList = [self->_srvRemainingEntriesAfterCurrentBucket mutableCopy];
+                self->_srvRemainingEntriesAfterCurrentBucket = nil;
+                self->_srvBucketConnectInProgress = NO;
             }
             
             NSString* message = st_error.localizedDescription;

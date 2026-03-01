@@ -10,12 +10,18 @@
 #import <XCTest/XCTest.h>
 #import <monalxmpp/MLConstants.h>
 #import <monalxmpp/MLHandler.h>
+#import <monalxmpp/xmpp.h>
 
 #define expressify(...)    ({ __VA_ARGS__ ;})
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wincomplete-implementation"
 #pragma clang diagnostic ignored "-Wprotocol"
+
+@interface xmpp (TestHelpers)
++(NSDictionary*) splitSrvEntriesByPriority:(NSArray<NSDictionary*>*) entries;
++(NSArray<NSDictionary*>*) weightedOrderForSrvEntries:(NSArray<NSDictionary*>*) entries;
+@end
 
 @interface HandlerTest : XCTestCase
 @end
@@ -148,6 +154,79 @@ $$
     XCTAssertNoThrow(expressify($call(handler, $ID(something, @"something01"))), "calling a handler should not trigger an exception");
     XCTAssertNoThrow(expressify($invalidate(handler, $ID(something, @"something02"))), "calling an invalidation after its handler should not trigger an exception");
     XCTAssertThrows(expressify($invalidate(handler, $ID(something, @"something03"))), "calling an invalidation twice should trigger an exception");
+}
+
+@end
+
+@interface XMPPConnectionLogicTest : XCTestCase
+@end
+
+@implementation XMPPConnectionLogicTest
+
+-(void) testSplitSrvEntriesByPriority
+{
+    NSArray<NSDictionary*>* input = @[
+        @{@"server": @"a.example.", @"priority": @10, @"weight": @5},
+        @{@"server": @"b.example.", @"priority": @10, @"weight": @15},
+        @{@"server": @"c.example.", @"priority": @20, @"weight": @1},
+        @{@"server": @"d.example.", @"priority": @30, @"weight": @1},
+    ];
+
+    NSDictionary* result = [xmpp splitSrvEntriesByPriority:input];
+    XCTAssertEqualObjects(result[@"priority"], @10);
+
+    NSArray<NSDictionary*>* samePriorityEntries = result[@"samePriorityEntries"];
+    NSArray<NSDictionary*>* remainingEntries = result[@"remainingEntries"];
+    XCTAssertEqual(samePriorityEntries.count, 2ul);
+    XCTAssertEqual(remainingEntries.count, 2ul);
+    XCTAssertEqualObjects(samePriorityEntries[0][@"server"], @"a.example.");
+    XCTAssertEqualObjects(samePriorityEntries[1][@"server"], @"b.example.");
+    XCTAssertEqualObjects(remainingEntries[0][@"server"], @"c.example.");
+    XCTAssertEqualObjects(remainingEntries[1][@"server"], @"d.example.");
+}
+
+-(void) testSplitSrvEntriesByPriorityWithEmptyInput
+{
+    NSDictionary* result = [xmpp splitSrvEntriesByPriority:@[]];
+    XCTAssertNil(result[@"priority"]);
+    XCTAssertEqual(((NSArray*)result[@"samePriorityEntries"]).count, 0ul);
+    XCTAssertEqual(((NSArray*)result[@"remainingEntries"]).count, 0ul);
+}
+
+-(void) testWeightedOrderForSrvEntriesPreservesEntries
+{
+    NSArray<NSDictionary*>* input = @[
+        @{@"server": @"a.example.", @"priority": @10, @"weight": @1},
+        @{@"server": @"b.example.", @"priority": @10, @"weight": @15},
+        @{@"server": @"c.example.", @"priority": @10, @"weight": @4},
+    ];
+
+    NSArray<NSDictionary*>* weighted = [xmpp weightedOrderForSrvEntries:input];
+    XCTAssertEqual(weighted.count, input.count);
+
+    NSMutableSet<NSString*>* inputServers = [NSMutableSet new];
+    NSMutableSet<NSString*>* weightedServers = [NSMutableSet new];
+    for(NSDictionary* entry in input)
+        [inputServers addObject:entry[@"server"]];
+    for(NSDictionary* entry in weighted)
+        [weightedServers addObject:entry[@"server"]];
+    XCTAssertEqualObjects(weightedServers, inputServers);
+}
+
+-(void) testWeightedOrderForSrvEntriesWithSingleEntry
+{
+    NSArray<NSDictionary*>* input = @[
+        @{@"server": @"single.example.", @"priority": @10, @"weight": @0},
+    ];
+    NSArray<NSDictionary*>* weighted = [xmpp weightedOrderForSrvEntries:input];
+    XCTAssertEqual(weighted.count, 1ul);
+    XCTAssertEqualObjects(weighted[0][@"server"], @"single.example.");
+}
+
+-(void) testWeightedOrderForSrvEntriesWithEmptyInput
+{
+    NSArray<NSDictionary*>* weighted = [xmpp weightedOrderForSrvEntries:@[]];
+    XCTAssertEqual(weighted.count, 0ul);
 }
 
 @end

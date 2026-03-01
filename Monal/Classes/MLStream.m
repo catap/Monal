@@ -13,8 +13,20 @@
 #import <monalxmpp/monalxmpp-Swift.h>
 
 @class MLCrypto;
+@class MLInputStream;
+@class MLOutputStream;
 
 #define BUFFER_SIZE 4096
+#define CONNECTION_ATTEMPT_DELAY_NSEC (NSEC_PER_MSEC * 250)
+
+@interface MLConnectionAttempt : NSObject
+@property (nonatomic, strong) NSDictionary* entry;
+@property (nonatomic) nw_connection_t connection;
+@property (nonatomic, nullable) nw_framer_t framer;
+@property (nonatomic, assign) BOOL wasOpenOnce;
+@property (nonatomic, assign) BOOL finished;
+@property (nonatomic, strong, nullable) NSError* lastError;
+@end
 
 @interface MLSharedStreamState : NSObject
 @property (atomic, strong) id<NSStreamDelegate> delegate;
@@ -28,6 +40,17 @@
 @property (atomic) nw_parameters_configure_protocol_block_t configure_tls_block;
 @property (atomic) nw_framer_t _Nullable framer;
 @property (atomic) NSCondition* tlsHandshakeCompleteCondition;
+@property (atomic, strong) NSDictionary* _Nullable winningConnectionDetails;
+@property (atomic, strong) NSArray<NSDictionary*>* connectEntries;
+@property (atomic, strong) NSMutableArray<MLConnectionAttempt*>* raceAttempts;
+@property (atomic, strong) dispatch_queue_t raceQueue;
+@property (atomic, strong) dispatch_source_t _Nullable raceTimer;
+@property (atomic, copy) dispatch_block_t _Nullable raceStarter;
+@property (atomic) NSUInteger nextConnectEntryToStart;
+@property (atomic) NSUInteger finishedRaceAttempts;
+@property (atomic) BOOL raceResolved;
+@property (atomic, weak) MLInputStream* inputStream;
+@property (atomic, weak) MLOutputStream* outputStream;
 @end
 
 @interface MLStream()
@@ -59,6 +82,9 @@
 }
 @end
 
+@implementation MLConnectionAttempt
+@end
+
 @implementation MLSharedStreamState
 
 -(instancetype) init
@@ -70,6 +96,17 @@
     self.hasTLS = NO;
     self.framer = nil;
     self.tlsHandshakeCompleteCondition = [NSCondition new];
+    self.winningConnectionDetails = nil;
+    self.connectEntries = @[];
+    self.raceAttempts = [NSMutableArray new];
+    self.raceQueue = dispatch_queue_create("im.monal.networking.race", DISPATCH_QUEUE_SERIAL);
+    self.raceTimer = nil;
+    self.raceStarter = nil;
+    self.nextConnectEntryToStart = 0;
+    self.finishedRaceAttempts = 0;
+    self.raceResolved = NO;
+    self.inputStream = nil;
+    self.outputStream = nil;
     return self;
 }
 
@@ -416,16 +453,29 @@
 
 +(void) connectWithSNIDomain:(NSString*) SNIDomain connectHost:(NSString*) host connectPort:(NSNumber*) port tls:(BOOL) tls inputStream:(NSInputStream* _Nullable * _Nonnull) inputStream  outputStream:(NSOutputStream* _Nullable * _Nonnull) outputStream logtag:(id _Nullable) logtag
 {
-    //create state
-    volatile __block BOOL wasOpenOnce = NO;
-    MLSharedStreamState* shared_state = [[MLSharedStreamState alloc] init];
+    NSDictionary* connectEntry = @{
+        @"connectHost": host,
+        @"connectPort": port,
+        @"isSecure": [NSNumber numberWithBool:tls],
+    };
+    [self connectWithSNIDomain:SNIDomain connectEntries:@[connectEntry] inputStream:inputStream outputStream:outputStream logtag:logtag];
+}
+
++(void) connectWithSNIDomain:(NSString*) SNIDomain connectEntries:(NSArray<NSDictionary*>*) connectEntries inputStream:(NSInputStream* _Nullable * _Nonnull) inputStream  outputStream:(NSOutputStream* _Nullable * _Nonnull) outputStream logtag:(id _Nullable) logtag
+{
+    MLAssert([connectEntries count] > 0, @"connectEntries must not be empty!");
     
+    //create state
     //create and configure public stream instances returned later
+    MLSharedStreamState* shared_state = [[MLSharedStreamState alloc] init];
     MLInputStream* input = [[MLInputStream alloc] initWithSharedState:shared_state];
     MLOutputStream* output = [[MLOutputStream alloc] initWithSharedState:shared_state];
+    shared_state.inputStream = input;
+    shared_state.outputStream = output;
+    shared_state.connectEntries = [connectEntries copy];
     
     nw_parameters_configure_protocol_block_t tcp_options = ^(nw_protocol_options_t tcp_options) {
-        nw_tcp_options_set_enable_fast_open(tcp_options, YES);      //enable tcp fast open
+        nw_tcp_options_set_enable_fast_open(tcp_options, YES);
         //nw_tcp_options_set_no_delay(tcp_options, YES);            //disable nagle's algorithm
         //nw_tcp_options_set_connection_timeout(tcp_options, 4);
     };
@@ -446,179 +496,341 @@
         //see also https://developer.apple.com/documentation/security/preventing_insecure_network_connections?language=objc
         sec_protocol_options_append_tls_ciphersuite_group(options, tls_ciphersuite_group_ats);
     };
+    //configure shared state
+    shared_state.configure_tls_block = configure_tls_block;
     
-    //configure tcp connection parameters
-    nw_parameters_t parameters;
-    if(tls)
-    {
-        parameters = nw_parameters_create_secure_tcp(configure_tls_block, tcp_options);
-        shared_state.hasTLS = YES;
-    }
-    else
-    {
-        parameters = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, tcp_options);
-        shared_state.hasTLS = NO;
+    void (^cancelRaceTimer)(void) = ^{
+        if(shared_state.raceTimer != nil)
+        {
+            dispatch_source_cancel(shared_state.raceTimer);
+            shared_state.raceTimer = nil;
+        }
+    };
+
+    void (^finishWithErrorIfNeeded)(void) = ^{
+        if(shared_state.raceResolved)
+            return;
+        if(shared_state.nextConnectEntryToStart < [shared_state.connectEntries count])
+            return;
+        if([shared_state.raceAttempts count] == 0 || shared_state.finishedRaceAttempts < [shared_state.raceAttempts count])
+            return;
         
-        //create simple framer and append it to our stack
-        //first framer initialization is allowed to send tcp early data
-        volatile __block int startupCounter = 0;     //workaround for some weird apple stuff, see below
-        nw_protocol_definition_t starttls_framer_definition = nw_framer_create_definition([[[NSUUID UUID] UUIDString] UTF8String], NW_FRAMER_CREATE_FLAGS_DEFAULT, ^(nw_framer_t framer) {
-            //we don't need any locking for our counter because all framers will be started in the same internal network queue
-            int framerId = startupCounter++;
-            DDLogInfo(@"%@: Framer(%d) %@ start called with wasOpenOnce=%@...", logtag, framerId, framer, bool2str(wasOpenOnce));
-            nw_framer_set_stop_handler(framer, (nw_framer_stop_handler_t)^(nw_framer_t _Nullable framer) {
-                DDLogInfo(@"%@, Framer(%d) stop called: %@", logtag, framerId, framer);
-                return YES;
-            });
-            
-            //some weird apple stuff creates the framer twice: once directly when starting the tcp handshake
-            //and once a few milliseconds later, presumably after the tcp connection was established successfully
-            //--> ignore all but the first one
-            if(framerId < 1)
+        NSError* lastError = nil;
+        for(MLConnectionAttempt* entry in [shared_state.raceAttempts reverseObjectEnumerator])
+            if(entry.lastError != nil)
             {
-                DDLogVerbose(@"Framer is the first one, using it...");
-                //we have to simulate nw_connection_state_ready because the connection state will not reflect that while our framer is active
-                //--> use framer start as "connection active" signal
-                //first framer start is allowed to directly send data which will be used as tcp early data
-                if(!wasOpenOnce)
+                lastError = entry.lastError;
+                break;
+            }
+        if(lastError == nil)
+            lastError = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotConnectToHost userInfo:nil];
+
+        DDLogError(@"%@: All connection attempts failed: %@", logtag, lastError);
+        cancelRaceTimer();
+        @synchronized(shared_state) {
+            shared_state.error = lastError;
+            shared_state.open = NO;
+            shared_state.framer = nil;
+        }
+        [input generateEvent:NSStreamEventErrorOccurred];
+        [output generateEvent:NSStreamEventErrorOccurred];
+    };
+    
+    __block void (^selectWinner)(MLConnectionAttempt*);
+    selectWinner = ^(MLConnectionAttempt* winner) {
+        if(shared_state.raceResolved)
+            return;
+        shared_state.raceResolved = YES;
+
+        NSDictionary* entry = winner.entry;
+        NSString* host = nilExtractor(entry[@"connectHost"]);
+        if(host == nil)
+            host = nilExtractor(entry[@"server"]);
+        NSNumber* port = nilExtractor(entry[@"connectPort"]);
+        if(port == nil)
+            port = nilExtractor(entry[@"port"]);
+        BOOL isSecure = [entry[@"isSecure"] boolValue];
+        
+        DDLogInfo(@"%@: Connection attempt won: host=%@ port=%@ directTLS=%@", logtag, host, port, bool2str(isSecure));
+        cancelRaceTimer();
+        @synchronized(shared_state) {
+            shared_state.connection = winner.connection;
+            shared_state.framer = winner.framer;
+            shared_state.hasTLS = isSecure;
+            shared_state.open = YES;
+            shared_state.error = nil;
+            shared_state.winningConnectionDetails = @{
+                @"connectHost": nilWrapper(host),
+                @"connectPort": nilWrapper(port),
+                @"isSecure": [NSNumber numberWithBool:isSecure],
+            };
+        }
+
+        for(MLConnectionAttempt* attempt in shared_state.raceAttempts)
+            if(attempt.connection != winner.connection)
+                nw_connection_force_cancel(attempt.connection);
+
+        //make sure to not do this inside the framer thread to not cause any deadlocks
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [input generateEvent:NSStreamEventOpenCompleted];
+            [output generateEvent:NSStreamEventOpenCompleted];
+        });
+    };
+
+    void (^markAttemptFinished)(MLConnectionAttempt*, NSError*) = ^(MLConnectionAttempt* attempt, NSError* error) {
+        if(error != nil)
+            attempt.lastError = error;
+        if(attempt.finished)
+            return;
+        attempt.finished = YES;
+        shared_state.finishedRaceAttempts++;
+        finishWithErrorIfNeeded();
+    };
+
+    __block void (^startAttemptForEntry)(NSDictionary*);
+    startAttemptForEntry = ^(NSDictionary* entry) {
+        NSString* host = nilExtractor(entry[@"connectHost"]);
+        if(host == nil)
+            host = nilExtractor(entry[@"server"]);
+        NSNumber* port = nilExtractor(entry[@"connectPort"]);
+        if(port == nil)
+            port = nilExtractor(entry[@"port"]);
+        BOOL tls = [entry[@"isSecure"] boolValue];
+        
+        if(host == nil || port == nil)
+        {
+            DDLogError(@"%@: Ignoring malformed connect entry: %@", logtag, entry);
+            MLConnectionAttempt* attempt = [MLConnectionAttempt new];
+            attempt.entry = entry;
+            [shared_state.raceAttempts addObject:attempt];
+            markAttemptFinished(attempt, [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadURL userInfo:nil]);
+            return;
+        }
+
+        MLConnectionAttempt* attempt = [MLConnectionAttempt new];
+        attempt.entry = entry;
+        attempt.wasOpenOnce = NO;
+        attempt.finished = NO;
+        attempt.lastError = nil;
+        [shared_state.raceAttempts addObject:attempt];
+
+        //configure tcp connection parameters
+        nw_parameters_t parameters;
+        if(tls)
+            parameters = nw_parameters_create_secure_tcp(configure_tls_block, tcp_options);
+        else
+        {
+            //create simple framer and append it to our stack
+            //first framer initialization is allowed to send tcp early data
+            parameters = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, tcp_options);
+            volatile __block int startupCounter = 0;
+            nw_protocol_definition_t starttls_framer_definition = nw_framer_create_definition([[[NSUUID UUID] UUIDString] UTF8String], NW_FRAMER_CREATE_FLAGS_DEFAULT, ^(nw_framer_t framer) {
+                //we don't need any locking for our counter because all framers will be started in the same internal network queue
+                int framerId = startupCounter++;
+                DDLogInfo(@"%@: Framer(%d) %@ start called for %@", logtag, framerId, framer, host);
+                nw_framer_set_stop_handler(framer, (nw_framer_stop_handler_t)^(nw_framer_t _Nullable framer) {
+                    DDLogInfo(@"%@: Framer(%d) stop called: %@", logtag, framerId, framer);
+                    return YES;
+                });
+
+                //some weird apple stuff creates the framer twice: once directly when starting the tcp handshake
+                //and once a few milliseconds later, presumably after the tcp connection was established successfully
+                //--> ignore all but the first one
+                if(framerId < 1)
                 {
-                    wasOpenOnce = YES;
-                    @synchronized(shared_state) {
-                        shared_state.open = YES;
+                    //we have to simulate nw_connection_state_ready because the connection state will not reflect that while our framer is active
+                    //--> use framer start as "connection active" signal
+                    //first framer start is allowed to directly send data which will be used as tcp early data
+                    attempt.framer = framer;
+                    if(!attempt.wasOpenOnce)
+                    {
+                        attempt.wasOpenOnce = YES;
+                        selectWinner(attempt);
                     }
-                    //make sure to not do this inside the framer thread to not cause any deadlocks
-                    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                        [input generateEvent:NSStreamEventOpenCompleted];
-                        [output generateEvent:NSStreamEventOpenCompleted];
+                    nw_framer_set_input_handler(framer, ^size_t(nw_framer_t framer) {
+                        if(shared_state.connection == attempt.connection && shared_state.framer == framer)
+                        {
+                            DDLogDebug(@"Got new input for winning framer: %@", framer);
+                            [input schedule_read];
+                        }
+                        return 0;
+                    });
+                    nw_framer_set_output_handler(framer, ^(nw_framer_t framer, nw_framer_message_t message, size_t message_length, bool is_complete) {
+                        MLAssert(NO, @"Unexpected outgoing bytes in framer!", (@{
+                            @"logtag": nilWrapper(logtag),
+                            @"framer": framer,
+                            @"message": message,
+                            @"message_length": @(message_length),
+                            @"is_complete": bool2str(is_complete),
+                        }));
                     });
                 }
-                
-                nw_framer_set_input_handler(framer, ^size_t(nw_framer_t framer) {
-                    DDLogDebug(@"Got new input for framer: %@", framer);
-                    [input schedule_read];
-                    return 0;       //why that??
-                });
-                nw_framer_set_output_handler(framer, ^(nw_framer_t framer, nw_framer_message_t message, size_t message_length, bool is_complete) {
-                    MLAssert(NO, @"Unexpected outgoing bytes in framer!", (@{
-                        @"logtag": nilWrapper(logtag),
-                        @"framer": framer,
-                        @"message": message,
-                        @"message_length": @(message_length),
-                        @"is_complete": bool2str(is_complete),
-                    }));
-                });
-                
-                shared_state.framer = framer;
-            }
-            else
-                DDLogVerbose(@"Ignoring subsequent framer...");
-            
-            return nw_framer_start_result_will_mark_ready;
-        });
-        DDLogInfo(@"%@: Not doing direct TLS: appending framer to protocol stack...", logtag);
-        nw_protocol_stack_prepend_application_protocol(nw_parameters_copy_default_protocol_stack(parameters), nw_framer_create_options(starttls_framer_definition));
-    }
-    //needed to activate tcp fast open with apple's internal tls framer
-    nw_parameters_set_fast_open_enabled(parameters, YES);
-    //use dnssec if configured
-    if([[HelperTools defaultsDB] boolForKey: @"useDnssecForAllConnections"])
-        nw_parameters_set_requires_dnssec_validation(parameters, YES);
-    
-    //create and configure connection object
-    nw_endpoint_t endpoint = nw_endpoint_create_host([host cStringUsingEncoding:NSUTF8StringEncoding], [[port stringValue] cStringUsingEncoding:NSUTF8StringEncoding]);
-    nw_connection_t connection = nw_connection_create(endpoint, parameters);
-    nw_connection_set_queue(connection, dispatch_queue_create_with_target([NSString stringWithFormat:@"im.monal.networking:%@", logtag].UTF8String, DISPATCH_QUEUE_SERIAL, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0)));
-    
-    //configure shared state
-    shared_state.connection = connection;
-    shared_state.configure_tls_block = configure_tls_block;
-        
-    //configure state change handler proxying state changes to our public stream instances
-    nw_connection_set_state_changed_handler(connection, ^(nw_connection_state_t state, nw_error_t error) {
-        @synchronized(shared_state) {
+                else
+                    DDLogVerbose(@"Ignoring subsequent framer...");
+
+                return nw_framer_start_result_will_mark_ready;
+            });
+            DDLogInfo(@"%@: Not doing direct TLS for %@:%@: appending framer to protocol stack...", logtag, host, port);
+            nw_protocol_stack_prepend_application_protocol(nw_parameters_copy_default_protocol_stack(parameters), nw_framer_create_options(starttls_framer_definition));
+        }
+
+        //needed to activate tcp fast open with apple's internal tls framer
+        nw_parameters_set_fast_open_enabled(parameters, YES);
+        //use dnssec if configured
+        if([[HelperTools defaultsDB] boolForKey: @"useDnssecForAllConnections"])
+            nw_parameters_set_requires_dnssec_validation(parameters, YES);
+
+        //create and configure connection object
+        nw_endpoint_t endpoint = nw_endpoint_create_host([host cStringUsingEncoding:NSUTF8StringEncoding], [[port stringValue] cStringUsingEncoding:NSUTF8StringEncoding]);
+        attempt.connection = nw_connection_create(endpoint, parameters);
+        nw_connection_set_queue(attempt.connection, shared_state.raceQueue);
+
+        DDLogInfo(@"%@: Starting connection attempt %lu/%lu to %@:%@ directTLS=%@", logtag, (unsigned long)[shared_state.raceAttempts count], (unsigned long)[shared_state.connectEntries count], host, port, bool2str(tls));
+        //configure state change handler proxying state changes to our public stream instances
+        nw_connection_set_state_changed_handler(attempt.connection, ^(nw_connection_state_t state, nw_error_t error) {
             //connection was opened once (e.g. opening=YES) and closed later on (e.g. open=NO)
-            if(wasOpenOnce && !shared_state.open)
+            if(shared_state.raceResolved && shared_state.connection != attempt.connection)
             {
-                DDLogVerbose(@"%@: ignoring call to nw_connection state_changed_handler, connection already closed: %@ --> %du, %@", logtag, self, state, error);
+                DDLogVerbose(@"%@: Ignoring callback for losing attempt %@:%@ state=%u", logtag, host, port, state);
                 return;
             }
-        }
-        //always handle errors regardless of current state (cert errors etc.)
-        if(error != nil)
-        {
-            DDLogVerbose(@"%@: %@ got error in state %du and reporting: %@", logtag, self, state, error);
-            NSError* st_error = (NSError*)CFBridgingRelease(nw_error_copy_cf_error(error));
-            @synchronized(shared_state) {
-                shared_state.error = st_error;
-            }
-            [input generateEvent:NSStreamEventErrorOccurred];
-            [output generateEvent:NSStreamEventErrorOccurred];
-        }
-        
-        if(state == nw_connection_state_waiting)
-        {
-            //do nothing here, documentation says the connection will be automatically retried "when conditions are favourable"
-            //which seems to mean: if the network path changed (for example connectivity regained)
-            //if this happens inside the connection timeout all is ok
-            //if not, the connection will be cancelled already and everything will be ok, too
-            DDLogVerbose(@"%@: got nw_connection_state_waiting and ignoring it, see comments in code: %@ (%@)", logtag, self, error);
-        }
-        else if(state == nw_connection_state_failed)
-        {
-            //errors already reported by generic handling above
-            DDLogError(@"%@: Connection failed (error already reported): %@", logtag, error);
-        }
-        else if(state == nw_connection_state_ready)
-        {
-            DDLogInfo(@"%@: Connection established, wasOpenOnce: %@", logtag, bool2str(wasOpenOnce));
-            if(!wasOpenOnce)
+
+            //always handle errors regardless of current state (cert errors etc.)
+            NSError* st_error = nil;
+            if(error != nil)
             {
-                wasOpenOnce = YES;
+                st_error = (NSError*)CFBridgingRelease(nw_error_copy_cf_error(error));
+                DDLogVerbose(@"%@: Connection attempt %@:%@ got error in state %u: %@", logtag, host, port, state, st_error);
+                attempt.lastError = st_error;
+            }
+
+            if(state == nw_connection_state_waiting)
+            {
+                //do nothing here, documentation says the connection will be automatically retried "when conditions are favourable"
+                //which seems to mean: if the network path changed (for example connectivity regained)
+                //if this happens inside the connection timeout all is ok
+                //if not, the connection will be cancelled already and everything will be ok, too
+                DDLogVerbose(@"%@: Connection attempt waiting %@:%@ (%@)", logtag, host, port, error);
+            }
+            else if(state == nw_connection_state_failed)
+            {
+                //errors already reported by generic handling above
+                DDLogError(@"%@: Connection attempt failed %@:%@ (%@)", logtag, host, port, error);
+
+                //if this is the winning connection, propagate the error to our stream users and unblock any STARTTLS handshake
+                BOOL winnerFailed = NO;
                 @synchronized(shared_state) {
-                    shared_state.open = YES;
+                    if(shared_state.raceResolved && shared_state.connection == attempt.connection)
+                    {
+                        winnerFailed = YES;
+                        if(st_error != nil)
+                            shared_state.error = st_error;
+                        else if(attempt.lastError != nil)
+                            shared_state.error = attempt.lastError;
+                        else
+                            shared_state.error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotConnectToHost userInfo:nil];
+                        shared_state.open = NO;
+                        shared_state.framer = nil;
+                    }
                 }
-                [input generateEvent:NSStreamEventOpenCompleted];
-                [output generateEvent:NSStreamEventOpenCompleted];
+                if(winnerFailed)
+                {
+                    [shared_state.tlsHandshakeCompleteCondition lock];
+                    [shared_state.tlsHandshakeCompleteCondition signal];
+                    [shared_state.tlsHandshakeCompleteCondition unlock];
+                    [input generateEvent:NSStreamEventErrorOccurred];
+                    [output generateEvent:NSStreamEventErrorOccurred];
+                }
+                markAttemptFinished(attempt, st_error);
             }
-            else
+            else if(state == nw_connection_state_ready)
             {
-                //the nw_connection_state_ready state while already wasOpenOnce comes from our framer set to ready
-                //this informs the upper layer that the connection is in ready state now, but we already treat the framer start
-                //as connection ready event
-                
-                @synchronized(shared_state) {
-                    //tls handshake completed now
-                    shared_state.hasTLS = YES;
-                    
+                DDLogInfo(@"%@: Connection attempt ready %@:%@ directTLS=%@ wasOpenOnce=%@", logtag, host, port, bool2str(tls), bool2str(attempt.wasOpenOnce));
+                if(!attempt.wasOpenOnce)
+                {
+                    attempt.wasOpenOnce = YES;
+                    selectWinner(attempt);
+                }
+                else if(!tls && shared_state.connection == attempt.connection)
+                {
+                    //the nw_connection_state_ready state while already wasOpenOnce comes from our framer set to ready
+                    //this informs the upper layer that the connection is in ready state now, but we already treat the framer start
+                    //as connection ready event
+                    @synchronized(shared_state) {
+                        //tls handshake completed now
+                        shared_state.hasTLS = YES;
+                    }
                     //unlock thread waiting on tls handshake completion (starttls)
                     [shared_state.tlsHandshakeCompleteCondition lock];
                     [shared_state.tlsHandshakeCompleteCondition signal];
                     [shared_state.tlsHandshakeCompleteCondition unlock];
+                    //we still want to inform our stream users that they can write data now and schedule a read operation
+                    [output generateEvent:NSStreamEventHasSpaceAvailable];
+                    [input schedule_read];
                 }
-                
-                //we still want to inform our stream users that they can write data now and schedule a read operation
-                [output generateEvent:NSStreamEventHasSpaceAvailable];
-                [input schedule_read];
             }
-        }
-        else if(state == nw_connection_state_cancelled)
-        {
-            //ignore this (we use reference counting)
-            DDLogVerbose(@"%@: ignoring call to nw_connection state_changed_handler with state nw_connection_state_cancelled: %@ (%@)", logtag, self, error);
-        }
-        else if(state == nw_connection_state_invalid)
-        {
-            //ignore all other states (preparing, invalid)
-            DDLogVerbose(@"%@: ignoring call to nw_connection state_changed_handler with state nw_connection_state_invalid: %@ (%@)", logtag, self, error);
-        }
-        else if(state == nw_connection_state_preparing)
-        {
-            //ignore all other states (preparing, invalid)
-            DDLogVerbose(@"%@: ignoring call to nw_connection state_changed_handler with state nw_connection_state_preparing: %@ (%@)", logtag, self, error);
-        }
-        else
-            unreachable();
-    });
+            else if(state == nw_connection_state_cancelled)
+            {
+                //ignore this (we use reference counting)
+                DDLogVerbose(@"%@: Connection attempt cancelled %@:%@", logtag, host, port);
+                if(!shared_state.raceResolved)
+                    markAttemptFinished(attempt, st_error);
+            }
+            else if(state == nw_connection_state_invalid)
+                //ignore all other states (preparing, invalid)
+                DDLogVerbose(@"%@: ignoring state invalid %@:%@", logtag, host, port);
+            else if(state == nw_connection_state_preparing)
+                //ignore all other states (preparing, invalid)
+                DDLogVerbose(@"%@: ignoring state preparing %@:%@", logtag, host, port);
+            else
+                unreachable();
+        });
+
+        nw_connection_start(attempt.connection);
+    };
+
+    void (^startNextAttempt)(void) = ^{
+        if(shared_state.raceResolved)
+            return;
+        if(shared_state.nextConnectEntryToStart >= [shared_state.connectEntries count])
+            return;
+
+        NSDictionary* entry = shared_state.connectEntries[shared_state.nextConnectEntryToStart];
+        shared_state.nextConnectEntryToStart++;
+        startAttemptForEntry(entry);
+
+        if(shared_state.nextConnectEntryToStart >= [shared_state.connectEntries count])
+            cancelRaceTimer();
+    };
+
+    weakify(shared_state);
+    shared_state.raceStarter = ^{
+        strongify(shared_state);
+        if(shared_state == nil)
+            return;
+
+        dispatch_async(shared_state.raceQueue, ^{
+            strongify(shared_state);
+            if(shared_state == nil)
+                return;
+
+            DDLogInfo(@"%@: Starting happy-eyeballs race with %lu entries", logtag, (unsigned long)[shared_state.connectEntries count]);
+            if(shared_state.raceResolved)
+                return;
+            startNextAttempt();
+            if(shared_state.raceResolved)
+                return;
+            if(shared_state.nextConnectEntryToStart < [shared_state.connectEntries count])
+            {
+                shared_state.raceTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, shared_state.raceQueue);
+                dispatch_source_set_timer(shared_state.raceTimer, dispatch_time(DISPATCH_TIME_NOW, CONNECTION_ATTEMPT_DELAY_NSEC), CONNECTION_ATTEMPT_DELAY_NSEC, NSEC_PER_MSEC * 10);
+                dispatch_source_set_event_handler(shared_state.raceTimer, ^{
+                    startNextAttempt();
+                });
+                dispatch_resume(shared_state.raceTimer);
+            }
+        });
+    };
     
     *inputStream = (NSInputStream*)input;
     *outputStream = (NSOutputStream*)output;
@@ -628,6 +840,11 @@
 {
     [self.shared_state.tlsHandshakeCompleteCondition lock];
     @synchronized(self.shared_state) {
+        if(self.shared_state.error != nil || !self.shared_state.open)
+        {
+            [self.shared_state.tlsHandshakeCompleteCondition unlock];
+            return;
+        }
         MLAssert(!self.shared_state.hasTLS, @"We already have TLS on this connection!");
         MLAssert(self.shared_state.framer != nil, @"Trying to start tls handshake without having a running framer!");
         DDLogInfo(@"Starting TLS handshake on framer: %@", self.shared_state.framer);
@@ -646,7 +863,14 @@
             }
         });
     }
-    [self.shared_state.tlsHandshakeCompleteCondition wait];
+    while(YES)
+    {
+        @synchronized(self.shared_state) {
+            if(self.shared_state.hasTLS || self.shared_state.error != nil || !self.shared_state.open)
+                break;
+        }
+        [self.shared_state.tlsHandshakeCompleteCondition wait];
+    }
     [self.shared_state.tlsHandshakeCompleteCondition unlock];
     DDLogInfo(@"TLS handshake completed: %@...", bool2str(self.shared_state.hasTLS));
 }
@@ -705,27 +929,73 @@
 
 -(void) open
 {
+    dispatch_block_t raceStarter = nil;
+    nw_connection_t connection = nil;
     @synchronized(self.shared_state) {
         MLAssert(!self.closed, @"streams can not be reopened!");
         self.open_called = YES;
         if(!self.shared_state.opening)
         {
-            DDLogVerbose(@"Calling nw_connection_start()...");
-            nw_connection_start(self.shared_state.connection);
+            raceStarter = self.shared_state.raceStarter;
+            connection = self.shared_state.connection;
+            self.shared_state.opening = YES;
         }
-        self.shared_state.opening = YES;
         //already opened by stream for other direction? --> directly trigger open event
         if(self.shared_state.open)
             [self generateEvent:NSStreamEventOpenCompleted];
+    }
+    if(raceStarter != nil)
+    {
+        DDLogVerbose(@"Calling race starter...");
+        raceStarter();
+    }
+    else if(connection != nil)
+    {
+        DDLogVerbose(@"Calling nw_connection_start()...");
+        nw_connection_start(connection);
     }
 }
 
 -(void) close
 {
     nw_connection_t connection;
+    NSArray<MLConnectionAttempt*>* raceAttempts;
+    dispatch_source_t raceTimer;
     @synchronized(self.shared_state) {
         connection = self.shared_state.connection;
+        raceAttempts = [self.shared_state.raceAttempts copy];
+        raceTimer = self.shared_state.raceTimer;
+        self.shared_state.raceTimer = nil;
+        self.shared_state.raceStarter = nil;
+        self.shared_state.raceResolved = YES;
+        self.shared_state.opening = NO;
+        self.shared_state.open = NO;
+        self.shared_state.framer = nil;
+        self.shared_state.connection = nil;
+        self.shared_state.winningConnectionDetails = nil;
+        self.shared_state.connectEntries = @[];
+        self.shared_state.raceAttempts = [NSMutableArray new];
+        self.shared_state.nextConnectEntryToStart = 0;
+        self.shared_state.finishedRaceAttempts = 0;
     }
+    if(raceTimer != nil)
+        dispatch_source_cancel(raceTimer);
+    for(MLConnectionAttempt* attempt in raceAttempts)
+        if(attempt.connection != nil && attempt.connection != connection)
+            nw_connection_force_cancel(attempt.connection);
+
+    if(connection == nil)
+    {
+        @synchronized(self.shared_state) {
+            self.closed = YES;
+        }
+        //unlock thread waiting on tls handshake
+        [self.shared_state.tlsHandshakeCompleteCondition lock];
+        [self.shared_state.tlsHandshakeCompleteCondition signal];
+        [self.shared_state.tlsHandshakeCompleteCondition unlock];
+        return;
+    }
+
     DDLogVerbose(@"Closing connection via nw_connection_send()...");
     nw_connection_send(connection, NULL, NW_CONNECTION_FINAL_MESSAGE_CONTEXT, YES, ^(nw_error_t  _Nullable error) {
         if(error)
@@ -742,13 +1012,12 @@
     });
     @synchronized(self.shared_state) {
         self.closed = YES;
-        self.shared_state.open = NO;
-        
-        //unlock thread waiting on tls handshake
-        [self.shared_state.tlsHandshakeCompleteCondition lock];
-        [self.shared_state.tlsHandshakeCompleteCondition signal];
-        [self.shared_state.tlsHandshakeCompleteCondition unlock];
     }
+
+    //unlock thread waiting on tls handshake
+    [self.shared_state.tlsHandshakeCompleteCondition lock];
+    [self.shared_state.tlsHandshakeCompleteCondition signal];
+    [self.shared_state.tlsHandshakeCompleteCondition unlock];
 }
 
 -(void) setDelegate:(id<NSStreamDelegate>) delegate
@@ -809,6 +1078,15 @@
         error = self.shared_state.error;
     }
     return error;
+}
+
+-(NSDictionary* _Nullable) winningConnectionDetails
+{
+    NSDictionary* details = nil;
+    @synchronized(self.shared_state) {
+        details = self.shared_state.winningConnectionDetails;
+    }
+    return details;
 }
 
 //list supported channel-binding types (highest security first!)
